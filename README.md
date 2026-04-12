@@ -264,8 +264,25 @@ Environment variables (all optional, see `backend/app/config.py` and `backend/ap
 | `FRIDA_IDE_APKTOOL` | autodetect | Path to `apktool`. |
 | `FRIDA_IDE_JADX` | autodetect | Path to `jadx`. |
 | `FRIDA_IDE_CLAUDE_BIN` | `shutil.which("claude")` | Path to the `claude` CLI for the AI tab. |
+| `FRIDA_IDE_CLAUDE_SYSTEM_PROMPT` | _(unset)_ | Literal system prompt appended to Claude's built-in one for **every** AI session. Takes precedence over the user file below. |
 
 Discovery order for ADB / jadx / apktool / claude: explicit env var → `$PATH` → standard SDK locations (e.g. `~/Library/Android/sdk/platform-tools/adb` on macOS, `~/Android/Sdk/platform-tools/adb` on Linux).
+
+### Claude system prompt
+
+Every AI session is spawned with `claude --append-system-prompt <text>`, which stacks a Frida-IDE-specific prompt **on top of** Claude Code's built-in defaults (so tool-use conventions, CLAUDE.md discovery, and safety rails are all still in place). The baked-in prompt teaches Claude:
+
+- The `cwd` is a decompiled APK tree with `apk/`, `apktool-out/`, `jadx-out/sources/`, and `meta.json`.
+- Investigate by reading `meta.json` and grepping `jadx-out/sources/` before touching smali.
+- **Save scripts as `.js` files via the `Write` tool** so `Extract Script → Editor` can read them off disk; iterate with `Edit`, never paste a long script in a fenced block expecting the user to copy it.
+- Frida conventions: `Java.perform`, `Interceptor.attach`, `send()` for runtime output, banner comments with target + hooks list, Toast on hook-loaded.
+
+**Overriding it** — both are hot-loaded per session, no IDE restart needed:
+
+1. Drop a Markdown file at `~/.frida-ide/claude_system_prompt.md`. Its contents replace the default.
+2. Or set `FRIDA_IDE_CLAUDE_SYSTEM_PROMPT='...'` — takes precedence over the file.
+
+The full default lives in `backend/app/services/claude_runner.py` (search for `_DEFAULT_SYSTEM_PROMPT`) and is a good starting point to copy, tweak, and drop into your own file.
 
 ---
 

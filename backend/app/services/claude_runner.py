@@ -33,6 +33,7 @@ from typing import Any
 
 from sqlmodel import Session
 
+from ..config import settings
 from ..db import engine
 from ..models.ai_session import AiMessage, AiSession
 from ..utils.paths import find_claude
@@ -41,6 +42,109 @@ from .pubsub import pubsub
 
 class ClaudeNotFoundError(RuntimeError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# System-prompt injection
+# ---------------------------------------------------------------------------
+
+# This is appended to Claude Code's built-in system prompt via
+# ``--append-system-prompt``. It doesn't replace the defaults — so tool-use
+# conventions, CLAUDE.md discovery, and safety rails all stay in place — it
+# just teaches Claude the Frida IDE's layout and file conventions so hooks
+# land where ``Extract Script → Editor`` expects to find them.
+#
+# Users can override or extend this by:
+#   1. Writing to ``~/.frida-ide/claude_system_prompt.md`` (takes precedence)
+#   2. Setting ``FRIDA_IDE_CLAUDE_SYSTEM_PROMPT`` to a literal string
+# Both are hot-loaded per session, so you can iterate on the prompt without
+# restarting the IDE.
+
+_DEFAULT_SYSTEM_PROMPT = """\
+# Frida IDE context
+
+You are running inside the **Frida IDE**, a web-based workbench for dynamic
+instrumentation of Android apps. Your working directory (`cwd`) is the
+project's decompiled APK tree, structured like:
+
+    ./apk/base.apk              # original APK(s)
+    ./apktool-out/              # apktool output (smali, res, AndroidManifest.xml)
+    ./jadx-out/sources/         # jadx-decompiled Java sources — READ THESE FIRST
+    ./meta.json                 # package_name, version, permissions, etc.
+
+## Your job
+
+When the user asks you to "hook X", "find Y", or "bypass Z":
+
+1. **Investigate first.** Read `meta.json` for the package id, then grep
+   `jadx-out/sources/` for relevant class names, strings, or API calls. Only
+   touch `apktool-out/` if you specifically need smali or resources.
+2. **Write the hook as a real file** in the project directory using the Write
+   tool. Prefer absolute paths like `./hook_<name>.js` or `./bypass_<thing>.js`
+   — the IDE's `Extract Script → Editor` button reads the on-disk file for
+   whichever `.js` path you most recently touched, so iterative Edit calls
+   always land the full current script. NEVER paste a long script inline in a
+   fenced block expecting the user to copy it — always save it via Write.
+3. **Iterate via Edit, not Write.** Once you've saved a script, further
+   changes should use the Edit tool so the file's history is preserved and
+   Extract Script still gives the user the full current version.
+
+## Frida script conventions
+
+- Use `send(value)` for runtime output — it streams into the IDE's xterm
+  console next to the editor. `console.log` also works but `send` is richer.
+- Wrap Java hooks in `Java.perform(function () { ... })`. The IDE's bridge
+  loader injects Java/ObjC bridges automatically; don't add your own import
+  shims.
+- For native hooks, `Interceptor.attach(Module.findExportByName(...), {...})`.
+- Start each script with a short banner comment that names what it hooks and
+  any class/method names the user should know about, e.g.:
+
+      // bypass_root.js — neutralises RootBeer checks + Settings.Secure.ADB
+      // Target: com.example.app
+      // Hooks: com.scottyab.rootbeer.RootBeer.isRooted (→ false)
+      //        android.provider.Settings$Secure.getString (→ "0" for ADB)
+
+- At the end of a hook, a Toast ("Frida: hooks loaded") or `send('all hooks
+  installed')` makes it obvious the script ran.
+- Prefer idempotent hooks: use `Java.use(...).method.implementation = ...`
+  rather than `Java.use(...).method.overloads`, unless you genuinely need
+  to disambiguate a specific overload.
+
+## When asked for a script
+
+Respond with a brief (1–3 sentence) explanation of what you hooked and why,
+**then** call the Write tool to save the script. Do NOT paste the whole
+script in a text block — the user will extract it from disk.
+
+## When asked to explain existing code
+
+Quote short snippets inline (a few lines in a fence is fine for discussion).
+The disk-read extract path only kicks in when you touch a `.js` file via
+Write/Edit/MultiEdit, so commentary on Java/smali code stays in the chat.
+"""
+
+
+def _load_system_prompt() -> str:
+    """Return the system prompt to append for this Claude session.
+
+    Priority: env var > user file > baked-in default. Each call re-reads the
+    file so users can iterate on the prompt without restarting the IDE.
+    """
+    env_override = os.environ.get("FRIDA_IDE_CLAUDE_SYSTEM_PROMPT")
+    if env_override and env_override.strip():
+        return env_override
+
+    user_file = settings.data_dir / "claude_system_prompt.md"
+    if user_file.exists():
+        try:
+            text = user_file.read_text(encoding="utf-8")
+            if text.strip():
+                return text
+        except OSError:
+            pass
+
+    return _DEFAULT_SYSTEM_PROMPT
 
 
 def _publish(ai_session_id: int, payload: dict[str, Any]) -> None:
@@ -104,6 +208,12 @@ class ClaudeRunner:
             "--permission-mode=bypassPermissions",
             "--model",
             "sonnet",
+            # Append Frida-IDE conventions to the built-in system prompt so
+            # Claude knows to save hooks as .js files in the project dir
+            # (where Extract Script picks them up off disk) and to use the
+            # Frida API patterns the user expects.
+            "--append-system-prompt",
+            _load_system_prompt(),
         ]
 
         # Inherit environment so the user's keychain auth + CLAUDE_* vars work.
