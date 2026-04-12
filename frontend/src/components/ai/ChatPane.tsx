@@ -20,6 +20,33 @@ export function ChatPane({ projectId, sessionId }: Props) {
   const [thinking, setThinking] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
 
+  // Shared dedup set across the /messages backfill and the live WS stream.
+  // The page can be opened in the middle of an active Claude response, in
+  // which case a single event can be delivered by both paths. The reducer
+  // skips events whose stable dedup key (Claude message.id, tool_use_id,
+  // DB row id for user_sent) is already in this set.
+  //
+  // We key the set per (projectId, sessionId) and hold it outside the
+  // component via ``useRef`` of a ``Map`` so that StrictMode's simulated
+  // unmount/remount does NOT wipe entries accumulated by the first
+  // connection before the second one is live. Entries are cleared lazily
+  // when a new session is opened.
+  const sessionKey = `${projectId}:${sessionId}`
+  const seenMapRef = useRef<Map<string, Set<string>>>(new Map())
+  const getSeen = (): Set<string> => {
+    let set = seenMapRef.current.get(sessionKey)
+    if (!set) {
+      set = new Set()
+      seenMapRef.current.set(sessionKey, set)
+    }
+    return set
+  }
+  // Clear rendered turns when the session changes — the seen set for the
+  // new session is fresh automatically via getSeen().
+  useEffect(() => {
+    setTurns([])
+  }, [sessionKey])
+
   // Backfill from /messages on mount so reload restores the conversation.
   useEffect(() => {
     let cancelled = false
@@ -27,15 +54,27 @@ export function ChatPane({ projectId, sessionId }: Props) {
       .getAiMessages(projectId, sessionId)
       .then((msgs) => {
         if (cancelled) return
-        let acc: ChatTurn[] = []
-        for (const m of msgs) {
-          acc = reduceEvent(acc, {
-            role: m.role,
-            content: m.content,
-            ts: m.ts,
-          } as StreamEvent)
-        }
-        setTurns(acc)
+        // Reduce the backfilled rows into our state using the same seen set
+        // so the live WS stream (which starts in parallel) can't re-insert
+        // events that are already in this snapshot. The row's ``id`` is
+        // passed through so dedupKey can derive ``us:db:<id>`` for user_sent.
+        const seen = getSeen()
+        setTurns((prev) => {
+          let acc = prev
+          for (const m of msgs) {
+            acc = reduceEvent(
+              acc,
+              {
+                role: m.role,
+                content: m.content,
+                ts: m.ts,
+                id: m.id,
+              } as StreamEvent,
+              seen
+            )
+          }
+          return acc
+        })
       })
       .catch(() => {
         /* ignore — empty session is fine */
@@ -43,23 +82,26 @@ export function ChatPane({ projectId, sessionId }: Props) {
     return () => {
       cancelled = true
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, sessionId])
 
-  // Live updates from the runner via WS. We use `initialLastEventId: null`
-  // (live-only) because the /messages backfill above is already the source
-  // of truth for history. Asking the WS to also replay (-1) double-feeds
-  // every turn into reduceEvent, which is what caused the duplicate
-  // assistant/tool_use blocks in the UI.
+  // Live updates from the runner via WS. We still request a full replay
+  // (initialLastEventId: -1) so that if the backend was restarted and the
+  // /messages backfill returns rows the ring buffer has forgotten, the UI
+  // still sees everything. The shared seen set dedup prevents duplicates
+  // when both paths deliver the same event.
   useStreamingWs({
     path: `/ws/ai/${sessionId}`,
     enabled: true,
-    initialLastEventId: null,
+    initialLastEventId: -1,
     onMessage: (msg: WsEnvelope) => {
-      // Detect "thinking" state from result events
-      if (msg.type === 'result' || (msg as { payload?: { type?: string } }).payload?.type === 'result') {
+      if (
+        msg.type === 'result' ||
+        (msg as { payload?: { type?: string } }).payload?.type === 'result'
+      ) {
         setThinking(false)
       }
-      setTurns((prev) => reduceEvent(prev, msg as StreamEvent))
+      setTurns((prev) => reduceEvent(prev, msg as StreamEvent, getSeen()))
     },
   })
 

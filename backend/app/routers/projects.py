@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from sqlmodel import Session, select
 
+from ..config import settings
 from ..db import engine
 from ..models.project import Project
+from ..services.adb import SERIAL_RE
 from ..services.apk_pipeline import project_root, start_pipeline
 
 # File(...) is hoisted to a module-level default to avoid B008 (function call in default).
@@ -130,6 +133,100 @@ async def create_project(files: list[UploadFile] = _FILES_DEFAULT) -> dict:
     # Kick off the decompile pipeline as a background task
     start_pipeline(project_id, saved_paths)
 
+    return result
+
+
+# Package-name validator shared with devices.py — keep both in sync.
+_PKG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
+
+
+@router.post("/from-pulled/{serial}/{identifier}")
+async def create_project_from_pulled(serial: str, identifier: str) -> dict:
+    """Create a project from APKs already pulled via the device router.
+
+    No upload round-trip: the server copies the previously-pulled files
+    from ``~/.frida-ide/pulled/<serial>/<identifier>/`` into a fresh
+    project directory and kicks off the normal decompile pipeline. Used
+    by the "Open in new project" action on the pull-completion toast.
+    """
+    if not SERIAL_RE.match(serial):
+        raise HTTPException(status_code=400, detail=f"Invalid serial: {serial!r}")
+    if not _PKG_RE.match(identifier):
+        raise HTTPException(
+            status_code=400, detail=f"Invalid package identifier: {identifier!r}"
+        )
+
+    # Resolve + sandbox-check the source directory. We refuse anything
+    # outside ~/.frida-ide/pulled/ so a crafted request can't copy
+    # arbitrary files into a project.
+    pulled_root = (settings.data_dir / "pulled").resolve()
+    source_dir = (pulled_root / serial / identifier).resolve()
+    try:
+        source_dir.relative_to(pulled_root)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400, detail="resolved source path escaped pulled root"
+        ) from e
+    if not source_dir.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No pulled APKs found for {identifier} on {serial}. "
+                "Hit Pull on the device first."
+            ),
+        )
+    apk_files = sorted(source_dir.glob("*.apk"))
+    if not apk_files:
+        raise HTTPException(
+            status_code=404, detail=f"No .apk files under {source_dir}"
+        )
+
+    # Pick a display name: prefer base.apk, else the largest file, else the
+    # package id. ``stem`` strips .apk so e.g. "Settings" shows up, not
+    # "Settings.apk".
+    base = next((p for p in apk_files if p.name == "base.apk"), None)
+    if base is None:
+        base = max(apk_files, key=lambda p: p.stat().st_size)
+    display_name = base.stem or identifier
+
+    # Allocate the Project row up front to get the ID for on-disk layout.
+    with Session(engine()) as db:
+        proj = Project(name=display_name, path="", status="queued")
+        db.add(proj)
+        db.commit()
+        db.refresh(proj)
+        project_id = proj.id
+        assert project_id is not None
+
+    root = project_root(project_id)
+    apk_dir = root / "apk"
+    apk_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths: list[Path] = []
+    sha256 = hashlib.sha256()
+    for src in apk_files:
+        dst = apk_dir / src.name
+        # shutil.copy preserves file content; we hash during copy so the
+        # project row's sha256 matches a fresh upload of the same file.
+        with open(src, "rb") as fin, open(dst, "wb") as fout:
+            while chunk := fin.read(1024 * 1024):
+                fout.write(chunk)
+                sha256.update(chunk)
+        saved_paths.append(dst)
+
+    with Session(engine()) as db:
+        p = db.get(Project, project_id)
+        assert p is not None
+        p.path = str(root)
+        p.sha256 = sha256.hexdigest()
+        db.add(p)
+        db.commit()
+        db.refresh(p)
+        result = _project_dict(p)
+
+    # Kick off decompile in the background — client will see status
+    # updates on the pipeline WS as the pipeline advances.
+    start_pipeline(project_id, saved_paths)
     return result
 
 

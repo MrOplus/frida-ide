@@ -54,7 +54,15 @@ def _publish(ai_session_id: int, payload: dict[str, Any]) -> None:
     )
 
 
-def _persist_message(ai_session_id: int, role: str, content: dict | list | str) -> None:
+def _persist_message(
+    ai_session_id: int, role: str, content: dict | list | str
+) -> int | None:
+    """Insert an AiMessage row and return the new primary key.
+
+    The id round-trips into the ``user_sent`` WS payload below so the frontend
+    reducer can dedupe between the /messages backfill and the live WS stream
+    using a stable identifier that survives both paths.
+    """
     with Session(engine()) as db:
         msg = AiMessage(
             ai_session_id=ai_session_id,
@@ -63,6 +71,8 @@ def _persist_message(ai_session_id: int, role: str, content: dict | list | str) 
         )
         db.add(msg)
         db.commit()
+        db.refresh(msg)
+        return msg.id
 
 
 class ClaudeRunner:
@@ -173,14 +183,20 @@ class ClaudeRunner:
         # Forward the raw event to the WS topic
         _publish(self.ai_session_id, obj)
 
-        # Persist messages we care about
+        # Persist messages we care about. We store the whole ``message``
+        # object (not just ``content``) so Claude's ``message.id`` survives
+        # round-trips through the DB — the frontend uses it to deduplicate
+        # between the /messages backfill and the live WS stream when a page
+        # is opened during an active response.
         if ev_type == "assistant":
-            content = obj.get("message", {}).get("content", [])
-            _persist_message(self.ai_session_id, "assistant", content)
+            message = obj.get("message", {})
+            _persist_message(self.ai_session_id, "assistant", message)
         elif ev_type == "user":
-            # Tool results come back as user messages with content arrays
-            content = obj.get("message", {}).get("content", [])
-            _persist_message(self.ai_session_id, "tool_result", content)
+            # Tool results come back as user messages with content arrays.
+            # Store the full message (including Claude's message.id) for the
+            # same dedup reason.
+            message = obj.get("message", {})
+            _persist_message(self.ai_session_id, "tool_result", message)
         elif ev_type == "system":
             _persist_message(self.ai_session_id, "system", obj)
 
@@ -194,8 +210,14 @@ class ClaudeRunner:
         line = (json.dumps(envelope) + "\n").encode("utf-8")
         self.proc.stdin.write(line)
         await self.proc.stdin.drain()
-        _persist_message(self.ai_session_id, "user", text)
-        _publish(self.ai_session_id, {"type": "user_sent", "content": text})
+        # Persist first, capture the DB row id, then echo it in the WS event
+        # so both the /messages backfill and the live WS use the same stable
+        # dedup key (``us:db:<id>``) on the frontend.
+        db_id = _persist_message(self.ai_session_id, "user", text)
+        _publish(
+            self.ai_session_id,
+            {"type": "user_sent", "content": text, "db_id": db_id},
+        )
 
     async def stop(self) -> None:
         if self._closed:

@@ -8,11 +8,13 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
+from ..config import settings
 from ..db import engine
 from ..models.ai_session import AiMessage, AiSession
 from ..models.project import Project
@@ -234,70 +236,147 @@ def _parse_fenced_blocks(text: str) -> list[tuple[str, str]]:
 _JS_PATH_RE = re.compile(r"\.(?:js|frida\.js)$", re.IGNORECASE)
 
 
-def _extract_from_write_tool_use(block: dict) -> str | None:
-    """Return the source text if ``block`` is a Write/Edit call targeting a JS file.
-
-    Claude's Write tool input has ``file_path`` and ``content``. Edit has
-    ``file_path`` and ``new_string`` (we accept it as a fallback when the
-    user asked Claude to rewrite an existing script).
+def _write_tool_file_path(block: dict) -> str | None:
+    """Return the ``file_path`` a Write/Edit/MultiEdit tool_use targeted, or
+    None if this block isn't one of those tools or doesn't target a ``.js``
+    file.
     """
     if not isinstance(block, dict) or block.get("type") != "tool_use":
         return None
     name = block.get("name", "")
+    if name not in ("Write", "Edit", "MultiEdit"):
+        return None
     inp = block.get("input") or {}
     if not isinstance(inp, dict):
         return None
     file_path = inp.get("file_path")
     if not isinstance(file_path, str) or not _JS_PATH_RE.search(file_path):
         return None
+    return file_path
+
+
+def _read_project_file(project_id: int, file_path: str) -> str | None:
+    """Read ``file_path`` from disk if it lives inside this project's tree.
+
+    Claude runs with its ``cwd`` under the project directory and frequently
+    edits scripts in place via Write → Edit → Edit → Edit. The *on-disk*
+    file is the canonical artefact at any given moment — an Edit tool's
+    ``new_string`` is only a patch fragment, which is exactly what used to
+    leak through the extractor as a "tail of the script" snippet.
+
+    We only read paths inside ``projects/<id>/`` (after resolving symlinks)
+    so the extractor can't be tricked into leaking arbitrary files from
+    disk via a crafted tool call.
+    """
+    try:
+        root = (settings.projects_dir / str(project_id)).resolve()
+        target = Path(file_path).resolve()
+        # Ensure the resolved target is inside the project root
+        target.relative_to(root)
+    except (ValueError, OSError):
+        return None
+    try:
+        return target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _extract_from_write_tool_use(block: dict) -> str | None:
+    """Fallback extractor for a Write/Edit tool_use when the on-disk file
+    isn't available. Only ``Write`` produces a usable full-file result;
+    ``Edit``/``MultiEdit`` returns a partial patch which would give the
+    caller a fragment, so we skip them here."""
+    file_path = _write_tool_file_path(block)
+    if file_path is None:
+        return None
+    name = block.get("name", "")
+    inp = block.get("input") or {}
     if name == "Write":
         content = inp.get("content")
         return content if isinstance(content, str) else None
-    if name == "Edit":
-        new_string = inp.get("new_string")
-        return new_string if isinstance(new_string, str) else None
+    # Edit / MultiEdit: no way to reconstruct the full file from a single
+    # patch — caller should fall back to the disk read or an earlier fence.
     return None
 
 
-def extract_javascript_from_messages(messages: list[dict]) -> ExtractedScript:
+def _split_assistant_blocks(
+    msg: dict,
+) -> tuple[list[str], list[dict]]:
+    """Return ``(text_chunks, tool_use_blocks)`` for a persisted assistant row.
+
+    Handles both the current persistence shape (``content`` is the full Claude
+    message dict ``{id, role, content: [...]}``) and the legacy shape
+    (``content`` is the raw content array). Rows with non-array content after
+    unwrapping return empty lists.
+    """
+    content = msg.get("content")
+    if (
+        isinstance(content, dict)
+        and "content" in content
+        and isinstance(content.get("content"), list)
+    ):
+        content = content["content"]
+
+    text_chunks: list[str] = []
+    tool_use_blocks: list[dict] = []
+    if isinstance(content, list):
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "text":
+                text_chunks.append(c.get("text", ""))
+            elif c.get("type") == "tool_use":
+                tool_use_blocks.append(c)
+    elif isinstance(content, str):
+        text_chunks.append(content)
+    return text_chunks, tool_use_blocks
+
+
+def extract_javascript_from_messages(
+    messages: list[dict], project_id: int | None = None
+) -> ExtractedScript:
     """Walk assistant messages newest-first and return the most recent JS source.
 
-    Lookup order, per assistant turn (highest priority first):
-    1. ``javascript``/``js``/``frida``-tagged fenced block in the message text.
-    2. ``Write``/``Edit`` tool_use targeting a ``.js`` file (the tool input
-       *is* the script — common when Claude saves directly via filesystem
-       tools instead of inlining the code).
-    3. Untagged fenced block (heuristic: assume it's JS).
+    Lookup order (highest priority first, each pass walks newest → oldest):
+
+    1. Most recent ``.js`` file Claude touched via ``Write``/``Edit``/
+       ``MultiEdit`` — read FROM DISK when ``project_id`` points at a real
+       project directory. This is the only reliable way to get the full
+       script when Claude iterated on it across multiple Edit calls, since
+       an Edit tool event carries just the patch fragment, not the whole
+       file.
+    2. Most recent ``Write`` tool_use content (no on-disk file, but Write
+       itself contained the full file text). ``Edit``/``MultiEdit`` are
+       deliberately NOT used at this level because their ``new_string``
+       is a partial patch.
+    3. Most recent ``javascript``/``js``/``frida``-tagged fenced block.
+    4. Most recent untagged fenced block — last resort.
     """
+    # Pass 1 — on-disk read of the newest Write/Edit target file.
+    if project_id is not None:
+        for msg in reversed(messages):
+            if msg.get("role") != "assistant":
+                continue
+            _, tool_use_blocks = _split_assistant_blocks(msg)
+            for tu in tool_use_blocks:
+                file_path = _write_tool_file_path(tu)
+                if file_path is None:
+                    continue
+                source = _read_project_file(project_id, file_path)
+                if source is not None:
+                    return ExtractedScript(
+                        found=True, source=source.strip(), language="javascript"
+                    )
+                # Path matched but we couldn't read the file (deleted,
+                # sandboxed out, …). Don't give up — fall through to the
+                # later passes below.
+                break
+
+    # Pass 2 — most recent Write tool content (in-band, not from disk).
     for msg in reversed(messages):
         if msg.get("role") != "assistant":
             continue
-        content = msg.get("content")
-
-        text_chunks: list[str] = []
-        tool_use_blocks: list[dict] = []
-        if isinstance(content, list):
-            for c in content:
-                if not isinstance(c, dict):
-                    continue
-                if c.get("type") == "text":
-                    text_chunks.append(c.get("text", ""))
-                elif c.get("type") == "tool_use":
-                    tool_use_blocks.append(c)
-        elif isinstance(content, str):
-            text_chunks.append(content)
-        else:
-            continue
-
-        text = "\n".join(text_chunks)
-        blocks = _parse_fenced_blocks(text)
-
-        # 1. Explicitly-tagged JS fence wins.
-        for tag, body in blocks:
-            if tag in JS_LANGS:
-                return ExtractedScript(found=True, source=body.strip(), language=tag)
-
-        # 2. Write/Edit tool targeting a .js path.
+        _, tool_use_blocks = _split_assistant_blocks(msg)
         for tu in tool_use_blocks:
             src = _extract_from_write_tool_use(tu)
             if src is not None:
@@ -305,7 +384,28 @@ def extract_javascript_from_messages(messages: list[dict]) -> ExtractedScript:
                     found=True, source=src.strip(), language="javascript"
                 )
 
-        # 3. Untagged fence as a last resort.
+    # Pass 3 — most recent explicitly-tagged JS fence.
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        text_chunks, _ = _split_assistant_blocks(msg)
+        if not text_chunks:
+            continue
+        text = "\n".join(text_chunks)
+        blocks = _parse_fenced_blocks(text)
+        for tag, body in blocks:
+            if tag in JS_LANGS:
+                return ExtractedScript(found=True, source=body.strip(), language=tag)
+
+    # Pass 4 — most recent untagged fence as a last resort.
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        text_chunks, _ = _split_assistant_blocks(msg)
+        if not text_chunks:
+            continue
+        text = "\n".join(text_chunks)
+        blocks = _parse_fenced_blocks(text)
         for tag, body in blocks:
             if not tag:
                 return ExtractedScript(
@@ -331,4 +431,4 @@ async def extract_script(project_id: int, ai_session_id: int) -> ExtractedScript
             except json.JSONDecodeError:
                 content = m.content_json
             messages.append({"role": m.role, "content": content})
-    return extract_javascript_from_messages(messages)
+    return extract_javascript_from_messages(messages, project_id=project_id)

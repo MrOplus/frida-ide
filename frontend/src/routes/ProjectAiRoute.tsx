@@ -28,7 +28,7 @@ export function ProjectAiRoute() {
   const projectId = param ? parseInt(param, 10) : null
   const navigate = useNavigate()
   const qc = useQueryClient()
-  const setSource = useEditorStore((s) => s.setSource)
+  const openFile = useEditorStore((s) => s.openFile)
 
   const projectQuery = useQuery({
     queryKey: ['project', projectId],
@@ -75,9 +75,11 @@ export function ProjectAiRoute() {
     mutationFn: (sid: number) => api.extractScript(projectId!, sid),
     onSuccess: (result) => {
       if (result.found && result.source) {
-        setSource(result.source)
-        // Use a query string flag so the editor route knows the buffer was preloaded
-        navigate('/devices')
+        // Open the extracted script as a fresh tab so the user's existing
+        // buffers are preserved, then jump to the Editor tab so they can
+        // pick a target and Run it.
+        openFile('extracted.js', result.source)
+        navigate('/editor')
       } else {
         alert('No JavaScript code block found in the most recent assistant message.')
       }

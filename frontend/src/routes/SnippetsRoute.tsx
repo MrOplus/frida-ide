@@ -19,7 +19,7 @@ export function SnippetsRoute() {
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [paramValues, setParamValues] = useState<Record<string, string>>({})
   const navigate = useNavigate()
-  const setSource = useEditorStore((s) => s.setSource)
+  const openFile = useEditorStore((s) => s.openFile)
 
   const snippetsQuery = useQuery({
     queryKey: ['snippets'],
@@ -63,8 +63,14 @@ export function SnippetsRoute() {
       const rendered = await api.renderSnippet(selected.id, paramValues)
       source = rendered.source
     }
-    setSource(source)
-    navigate('/devices')
+    // Open each snippet as its own tab so the user's current buffer is
+    // preserved, then jump to the Editor tab where they can Run it.
+    const name = `${selected.slug || selected.name || 'snippet'}.js`.replace(
+      /[^A-Za-z0-9._-]+/g,
+      '_'
+    )
+    openFile(name, source)
+    navigate('/editor')
   }
 
   return (

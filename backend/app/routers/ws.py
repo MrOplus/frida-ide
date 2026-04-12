@@ -23,11 +23,41 @@ router = APIRouter(tags=["websocket"])
 
 
 async def _stream_topic(ws: WebSocket, topic: str, last_event_id: int | None) -> None:
-    """Pump events from a single topic to a WebSocket until disconnect."""
+    """Pump events from a single topic to a WebSocket until disconnect.
+
+    Two concurrent tasks share this socket: the pubsub pump (sends events as
+    they're published) and the main receive loop (reads client frames and
+    sends ping/pong heartbeats). Starlette/uvicorn's ``send_json`` is NOT
+    concurrency-safe at the ASGI layer — two overlapping awaits can
+    interleave wire frames and raise inside starlette, which would kill the
+    pump, exit the main loop, and drop the connection. All sends here go
+    through ``send()`` below, which serialises writes with a single lock, so
+    the pump and heartbeat can run in parallel without corrupting the frame
+    stream.
+    """
     await ws.accept()
 
+    send_lock = asyncio.Lock()
+    closed = False
+
+    async def send(obj: dict) -> None:
+        nonlocal closed
+        if closed:
+            return
+        async with send_lock:
+            if closed:
+                return
+            try:
+                await ws.send_json(obj)
+            except (WebSocketDisconnect, RuntimeError):
+                # RuntimeError is raised by starlette when the socket has
+                # already been closed ("Cannot call 'send' once a close
+                # message has been sent"). Either way, mark the socket dead
+                # so later sends short-circuit instead of raising again.
+                closed = True
+
     # Send a hello message so the client immediately knows the connection is live.
-    await ws.send_json(
+    await send(
         {
             "type": "hello",
             "topic": topic,
@@ -40,14 +70,13 @@ async def _stream_topic(ws: WebSocket, topic: str, last_event_id: int | None) ->
     async def _pump() -> None:
         try:
             async for event in pubsub.subscribe(topic, last_event_id=last_event_id):
-                await ws.send_json(event)
+                await send(event)
+                if closed:
+                    break
         except WebSocketDisconnect:
             pass
         except Exception as e:  # noqa: BLE001
-            try:  # noqa: SIM105
-                await ws.send_json({"type": "error", "payload": str(e)})
-            except Exception:  # noqa: BLE001
-                pass
+            await send({"type": "error", "payload": str(e)})
         finally:
             sender_done.set()
 
@@ -55,14 +84,21 @@ async def _stream_topic(ws: WebSocket, topic: str, last_event_id: int | None) ->
 
     try:
         # Drain incoming frames so we notice disconnects + handle ping/pong.
-        while not sender_done.is_set():
+        # The receive-side timeout is deliberately LONGER than the client's
+        # 15 s heartbeat interval so the client's ping normally lands first
+        # and resets the timer; if the client is silent for a full 30 s we
+        # fall back to a server-initiated ping.
+        while not sender_done.is_set() and not closed:
             try:
-                msg = await asyncio.wait_for(ws.receive_text(), timeout=15.0)
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=30.0)
             except TimeoutError:
-                # Heartbeat — keeps NAT/proxies happy
-                await ws.send_json({"type": "ping", "ts": datetime.now(UTC).isoformat()})
+                await send({"type": "ping", "ts": datetime.now(UTC).isoformat()})
                 continue
             except WebSocketDisconnect:
+                break
+            except RuntimeError:
+                # Starlette raises "Cannot call 'receive' once a disconnect
+                # message has been received" if we race with a close frame.
                 break
 
             # Handle client commands (ping, etc.)
@@ -71,8 +107,12 @@ async def _stream_topic(ws: WebSocket, topic: str, last_event_id: int | None) ->
             except json.JSONDecodeError:
                 continue
             if data.get("type") == "ping":
-                await ws.send_json({"type": "pong", "ts": datetime.now(UTC).isoformat()})
+                await send({"type": "pong", "ts": datetime.now(UTC).isoformat()})
+            # pongs from the client are ignored by design — they count as a
+            # received frame (resetting the recv timeout above) which is all
+            # we need from them.
     finally:
+        closed = True
         pump_task.cancel()
         try:  # noqa: SIM105
             await pump_task

@@ -1,10 +1,20 @@
 import { useState, useMemo } from 'react'
 import { useNavigate, useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation } from '@tanstack/react-query'
-import { ChevronLeft, Search, Play, Zap, AlertCircle } from 'lucide-react'
+import {
+  ChevronLeft,
+  Search,
+  Play,
+  Zap,
+  AlertCircle,
+  Download,
+  Loader2,
+  Check,
+} from 'lucide-react'
 
 import { api } from '@/lib/api'
 import { useEditorStore } from '@/store/editorStore'
+import { toast } from '@/store/toastStore'
 
 type Tab = 'apps' | 'processes'
 
@@ -79,6 +89,65 @@ export function ProcessesRoute() {
     })
   }
 
+  // Per-package pull state so each row can show its own spinner/check
+  // without blocking clicks on the others.
+  const [pullState, setPullState] = useState<
+    Record<string, 'idle' | 'pulling' | 'done' | 'error'>
+  >({})
+  const [pullError, setPullError] = useState<string | null>(null)
+
+  const openInNewProject = async (identifier: string) => {
+    try {
+      const proj = await api.createProjectFromPulled(serial, identifier)
+      toast.success(`Project created: ${proj.name}`, {
+        description: `Decompile pipeline queued · id=${proj.id}`,
+      })
+      navigate(`/projects/${proj.id}/files`)
+    } catch (e) {
+      toast.error('Failed to open as project', {
+        description: (e as Error).message,
+      })
+    }
+  }
+
+  const pullApk = async (identifier: string) => {
+    setPullState((s) => ({ ...s, [identifier]: 'pulling' }))
+    setPullError(null)
+    try {
+      const resp = await api.pullApk(serial, identifier)
+      setPullState((s) => ({ ...s, [identifier]: 'done' }))
+      // Build a toast description that shows exactly where the APK(s)
+      // landed. When there's one APK, show its full path; with splits,
+      // show the containing directory + size summary.
+      const mb = (resp.total_size / (1024 * 1024)).toFixed(1)
+      const description =
+        resp.apks.length === 1
+          ? `${resp.apks[0].local_path} (${mb} MB)`
+          : `${resp.output_dir} · ${resp.apks.length} APKs, ${mb} MB`
+      toast.success(`Pulled ${identifier}`, {
+        description,
+        action: {
+          label: 'Open in new project',
+          onClick: () => openInNewProject(identifier),
+        },
+      })
+      // Flip back to idle after a moment so the user can pull again
+      window.setTimeout(
+        () => setPullState((s) => ({ ...s, [identifier]: 'idle' })),
+        3000
+      )
+    } catch (e) {
+      const msg = (e as Error).message
+      setPullState((s) => ({ ...s, [identifier]: 'error' }))
+      setPullError(msg)
+      toast.error(`Pull failed: ${identifier}`, { description: msg })
+      window.setTimeout(
+        () => setPullState((s) => ({ ...s, [identifier]: 'idle' })),
+        4000
+      )
+    }
+  }
+
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-border bg-bg-elevated px-4 py-3">
@@ -121,6 +190,12 @@ export function ProcessesRoute() {
           {(runMutation.error as Error).message}
         </div>
       )}
+      {pullError && (
+        <div className="flex items-center gap-2 border-b border-danger/40 bg-danger/10 px-4 py-2 text-xs text-danger">
+          <AlertCircle className="h-3.5 w-3.5" />
+          Pull failed: {pullError}
+        </div>
+      )}
 
       <div className="flex-1 overflow-auto">
         {tab === 'apps' ? (
@@ -157,6 +232,10 @@ export function ProcessesRoute() {
                   <td className="px-4 py-2 font-mono text-xs text-fg">{app.pid ?? '—'}</td>
                   <td className="px-4 py-2 text-right">
                     <div className="flex justify-end gap-1">
+                      <PullButton
+                        state={pullState[app.identifier] ?? 'idle'}
+                        onClick={() => pullApk(app.identifier)}
+                      />
                       <button
                         onClick={() => spawn(app.identifier)}
                         disabled={runMutation.isPending}
@@ -257,6 +336,32 @@ function TabBtn({
       }`}
     >
       {children}
+    </button>
+  )
+}
+
+function PullButton({
+  state,
+  onClick,
+}: {
+  state: 'idle' | 'pulling' | 'done' | 'error'
+  onClick: () => void
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={state === 'pulling'}
+      title="Pull APK(s) from device into ~/.frida-ide/pulled/"
+      className="flex items-center gap-1 rounded bg-bg-hover px-2 py-1 text-xs text-fg hover:bg-bg-hover/80 disabled:opacity-50"
+    >
+      {state === 'pulling' ? (
+        <Loader2 className="h-3 w-3 animate-spin" />
+      ) : state === 'done' ? (
+        <Check className="h-3 w-3 text-success" />
+      ) : (
+        <Download className="h-3 w-3" />
+      )}
+      Pull
     </button>
   )
 }

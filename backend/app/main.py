@@ -35,6 +35,7 @@ from .routers import (
     scripts,
     sessions,
     snippets,
+    tty,
     ws,
 )
 from .services.claude_runner import stop_all_runners
@@ -103,6 +104,7 @@ def create_app() -> FastAPI:
     app.include_router(sessions.router)
     app.include_router(emulators.router)
     app.include_router(codeshare.router)
+    app.include_router(tty.router)
     app.include_router(ws.router)
     app.include_router(_dev.router)
 

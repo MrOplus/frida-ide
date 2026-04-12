@@ -343,6 +343,36 @@ export const api = {
       { method: 'POST' }
     ),
 
+  // ----- Create project from pulled APKs -----
+  createProjectFromPulled: (serial: string, identifier: string) =>
+    request<ProjectInfo>(
+      `/api/projects/from-pulled/${encodeURIComponent(
+        serial
+      )}/${encodeURIComponent(identifier)}`,
+      { method: 'POST' }
+    ),
+
+  // ----- Pull APK from device -----
+  pullApk: (serial: string, identifier: string) =>
+    request<{
+      ok: boolean
+      serial: string
+      identifier: string
+      output_dir: string
+      apks: {
+        remote_path: string
+        local_path: string
+        filename: string
+        size: number
+      }[]
+      total_size: number
+    }>(
+      `/api/devices/${encodeURIComponent(serial)}/apps/${encodeURIComponent(
+        identifier
+      )}/pull`,
+      { method: 'POST' }
+    ),
+
   // ----- Sessions (recordings) -----
   sessions: (limit = 100) =>
     request<SessionSummary[]>(`/api/sessions?limit=${limit}`),
