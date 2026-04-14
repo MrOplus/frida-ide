@@ -38,13 +38,40 @@ export function SessionsRoute() {
     },
   })
 
+  const delAll = useMutation({
+    mutationFn: () => api.deleteAllSessions(),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['sessions'] })
+      setSelectedId(null)
+    },
+  })
+
   const sessions = sessionsQuery.data ?? []
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-border bg-bg-elevated px-4 py-3">
         <h1 className="text-lg font-semibold text-fg-strong">Sessions</h1>
-        <span className="text-xs text-fg-muted">{sessions.length} recorded</span>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-fg-muted">{sessions.length} recorded</span>
+          {sessions.length > 0 && (
+            <button
+              onClick={() => {
+                if (confirm(`Delete all ${sessions.length} sessions and their events?`))
+                  delAll.mutate()
+              }}
+              disabled={delAll.isPending}
+              className="flex items-center gap-1.5 rounded-md border border-danger/40 bg-danger/10 px-2 py-1 text-xs text-danger hover:bg-danger/20 disabled:opacity-50"
+            >
+              {delAll.isPending ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <Trash2 className="h-3 w-3" />
+              )}
+              Clear all
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="flex flex-1 overflow-hidden">

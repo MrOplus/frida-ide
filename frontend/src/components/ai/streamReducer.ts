@@ -245,105 +245,16 @@ function normalizeBackfillRow(event: StreamEvent): StreamEvent | null {
   return null
 }
 
-// Tiny non-crypto hash for dedup fingerprints. Matches the fnv-1a 32-bit
-// variant so backfill and live paths compute the same string from the same
-// input. Collisions are possible but vanishingly rare for message-sized text.
-function fnv1a(s: string): string {
-  let h = 0x811c9dc5
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i)
-    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0
-  }
-  return h.toString(16)
-}
-
-function dedupKey(event: StreamEvent): string | null {
-  const type = event.type
-
-  if (type === 'assistant' && event.message) {
-    // IMPORTANT: do NOT key assistant events by ``message.id`` alone.
-    // Claude stream-json emits a separate event per CONTENT BLOCK (thinking,
-    // text, tool_use, …) — and all of them share the same ``message.id``.
-    // If we key by msg.id the first event claims the key and the rest get
-    // silently deduped away, which is how text/tool_use responses
-    // disappeared from the UI.
-    //
-    // Key instead by the block's own stable fingerprint. Each event carries
-    // exactly one new block in practice, so hashing all blocks together is
-    // cheap and gives us a key that's identical between the /messages
-    // backfill and the live WS for the same event.
-    const content = event.message.content
-    if (Array.isArray(content) && content.length > 0) {
-      const parts: string[] = []
-      for (const c of content) {
-        if (c.type === 'tool_use' && c.id) {
-          parts.push(`tu:${c.id}`)
-        } else if (c.type === 'text' && typeof c.text === 'string') {
-          parts.push(`txt:${fnv1a(c.text)}`)
-        } else if (c.type === 'thinking') {
-          const t = (c as ContentBlock & { thinking?: string }).thinking ?? ''
-          parts.push(`th:${fnv1a(t)}`)
-        } else {
-          parts.push(`x:${c.type}`)
-        }
-      }
-      return `a:${event.message.id ?? ''}:${parts.join('|')}`
-    }
-    if (event.message.id) return `a:${event.message.id}`
-  }
-
-  if (type === 'user' && event.message?.content) {
-    const results = findToolResults(event.message.content)
-    if (results.length > 0) {
-      // Join all tool_use_ids so events carrying several tool_results at
-      // once (rare but possible) still have a unique composite key.
-      return `tr:${results.map((r) => r.toolUseId).join(',')}`
-    }
-    if (event.message.id) return `u:${event.message.id}`
-  }
-
-  if (type === 'user_sent') {
-    // Both the /messages backfill and the live WS round-trip the DB row id
-    // for this message. That gives us a stable key across both paths so the
-    // echo of a user message never renders twice even if the two paths race
-    // on mount.
-    const dbId = (event as { db_id?: number }).db_id
-    if (typeof dbId === 'number') return `us:db:${dbId}`
-    // Weaker fallback (older sessions that don't carry db_id yet): hash of
-    // content.
-    const text = (event as { content?: string }).content ?? ''
-    return `us:${fnv1a(text)}`
-  }
-
-  if (type === 'system') {
-    const subtype = (event as { subtype?: string }).subtype ?? ''
-    const sessionId = (event as { session_id?: string }).session_id ?? ''
-    return `sys:${subtype}:${sessionId}`
-  }
-  return null
-}
 
 export function reduceEvent(
   turns: ChatTurn[],
   rawEvent: StreamEvent,
-  seen?: Set<string>
 ): ChatTurn[] {
   // Normalise backfilled rows into stream-json shape so the rest of this
   // function only deals with one event format.
   const normalized = normalizeBackfillRow(rawEvent) ?? unwrap(rawEvent)
   const event = normalized
   const eventType = event.type
-
-  // Dedup via stable key derived from the event itself. Shared between
-  // backfill and live WS paths so a single event delivered by both is
-  // reduced at most once.
-  if (seen) {
-    const key = dedupKey(event)
-    if (key) {
-      if (seen.has(key)) return turns
-      seen.add(key)
-    }
-  }
 
   if (eventType === 'user_sent') {
     const text = (event as { content?: string }).content ?? ''

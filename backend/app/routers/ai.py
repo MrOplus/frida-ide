@@ -86,6 +86,8 @@ def _ai_session_dict(s: AiSession) -> dict:
         "status": s.status,
         "started_at": s.started_at.isoformat(),
         "ended_at": s.ended_at.isoformat() if s.ended_at else None,
+        "claude_session_id": s.claude_session_id,
+        "can_resume": bool(s.claude_session_id) and s.status in ("stopped", "error"),
     }
 
 
@@ -147,6 +149,47 @@ async def create_session(project_id: int) -> dict:
             "project_name": proj.package_name or proj.name,
             "cwd": str(cwd),
         }
+
+
+@router.post("/{project_id}/ai/session/{ai_session_id}/resume", response_model=None)
+async def resume_session(project_id: int, ai_session_id: int) -> dict:
+    """Restart the Claude subprocess for a stopped/errored session using
+    ``--resume <claude_session_id>`` so the full conversation context is
+    reloaded. The user sees it as a seamless continuation.
+    """
+    s = _session_or_404(project_id, ai_session_id)
+
+    # Don't resume something that's already running.
+    if get_runner(ai_session_id) is not None:
+        raise HTTPException(status_code=409, detail="session is already running")
+
+    claude_sid = s.claude_session_id
+    if not claude_sid:
+        raise HTTPException(
+            status_code=409,
+            detail="no Claude session_id stored — cannot resume. Start a new session instead.",
+        )
+
+    cwd = project_root(project_id) / "jadx-out"
+    if not cwd.exists():
+        cwd = project_root(project_id) / "apktool-out"
+    if not cwd.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"no decompiled output found for project {project_id}",
+        )
+
+    try:
+        await start_runner(ai_session_id, cwd, resume_session_id=claude_sid)
+    except ClaudeNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"failed to resume: {e}") from e
+
+    with Session(engine()) as db:
+        sess = db.get(AiSession, ai_session_id)
+        assert sess is not None
+        return _ai_session_dict(sess)
 
 
 @router.get("/{project_id}/ai/sessions")

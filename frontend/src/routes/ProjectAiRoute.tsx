@@ -9,6 +9,7 @@ import {
   PlusCircle,
   Sparkles,
   AlertCircle,
+  RotateCcw,
 } from 'lucide-react'
 
 import { api } from '@/lib/api'
@@ -43,17 +44,24 @@ export function ProjectAiRoute() {
     refetchInterval: 5_000,
   })
 
-  // Pick the most recent running session, or null if none
+  // Pick the most recent running session, or the most recent resumable one
   const runningSession = sessionsQuery.data?.find((s) => s.status === 'running') ?? null
+  const resumableSession =
+    runningSession ??
+    sessionsQuery.data?.find((s) => s.can_resume) ??
+    null
 
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null)
 
-  // Auto-select the running session when the list loads
+  // Auto-select the running or resumable session when the list loads
   useEffect(() => {
-    if (activeSessionId == null && runningSession) {
-      setActiveSessionId(runningSession.id)
+    if (activeSessionId == null && resumableSession) {
+      setActiveSessionId(resumableSession.id)
     }
-  }, [activeSessionId, runningSession])
+  }, [activeSessionId, resumableSession])
+
+  const activeSession = sessionsQuery.data?.find((s) => s.id === activeSessionId) ?? null
+  const canResume = activeSession?.can_resume ?? false
 
   const createMutation = useMutation({
     mutationFn: () => api.createAiSession(projectId!),
@@ -66,7 +74,14 @@ export function ProjectAiRoute() {
   const stopMutation = useMutation({
     mutationFn: (sid: number) => api.stopAiSession(projectId!, sid),
     onSuccess: () => {
-      setActiveSessionId(null)
+      qc.invalidateQueries({ queryKey: ['aiSessions', projectId] })
+    },
+  })
+
+  const resumeMutation = useMutation({
+    mutationFn: (sid: number) => api.resumeAiSession(projectId!, sid),
+    onSuccess: (s) => {
+      setActiveSessionId(s.id)
       qc.invalidateQueries({ queryKey: ['aiSessions', projectId] })
     },
   })
@@ -145,14 +160,25 @@ export function ProjectAiRoute() {
                   <Sparkles className="h-3 w-3" />
                   Extract Script → Editor
                 </button>
-                <button
-                  onClick={() => stopMutation.mutate(activeSessionId)}
-                  disabled={stopMutation.isPending}
-                  className="flex w-full items-center justify-center gap-1.5 rounded-md border border-border bg-bg px-3 py-1.5 text-xs text-fg hover:bg-bg-hover disabled:opacity-50"
-                >
-                  <Square className="h-3 w-3" />
-                  Stop session
-                </button>
+                {canResume ? (
+                  <button
+                    onClick={() => resumeMutation.mutate(activeSessionId)}
+                    disabled={resumeMutation.isPending}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-md bg-accent-muted px-3 py-1.5 text-xs font-medium text-fg-strong hover:bg-accent disabled:opacity-50"
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    {resumeMutation.isPending ? 'Resuming…' : 'Resume session'}
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => stopMutation.mutate(activeSessionId)}
+                    disabled={stopMutation.isPending}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-md border border-border bg-bg px-3 py-1.5 text-xs text-fg hover:bg-bg-hover disabled:opacity-50"
+                  >
+                    <Square className="h-3 w-3" />
+                    Stop session
+                  </button>
+                )}
               </div>
             ) : (
               <button
@@ -168,6 +194,12 @@ export function ProjectAiRoute() {
               <div className="mt-2 flex items-start gap-1.5 text-xs text-danger">
                 <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
                 {(createMutation.error as Error).message}
+              </div>
+            )}
+            {resumeMutation.isError && (
+              <div className="mt-2 flex items-start gap-1.5 text-xs text-danger">
+                <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+                Resume failed: {(resumeMutation.error as Error).message}
               </div>
             )}
           </div>

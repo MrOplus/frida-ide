@@ -11,6 +11,8 @@ Runs in two modes:
   also opens the default browser.
 """
 
+import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -41,6 +43,14 @@ from .routers import (
 from .services.claude_runner import stop_all_runners
 from .services.device_watcher import start_watcher, stop_watcher
 from .services.snippet_loader import seed_builtins
+
+# Wire up Python logging so every ``log.info(...)`` in our services prints.
+# Level is controllable via ``LOG_LEVEL`` env var (DEBUG / INFO / WARNING /
+# ERROR). Defaults to INFO so Claude subprocess lifecycle lines show up.
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(levelname)-7s %(name)s: %(message)s",
+)
 
 # The frontend's build output. Resolved relative to this file so it works
 # both from the source repo (sibling 'frontend' directory) and from a wheel

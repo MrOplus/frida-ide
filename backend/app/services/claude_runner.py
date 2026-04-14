@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 from datetime import UTC, datetime
@@ -38,6 +39,8 @@ from ..db import engine
 from ..models.ai_session import AiMessage, AiSession
 from ..utils.paths import find_claude
 from .pubsub import pubsub
+
+log = logging.getLogger(__name__)
 
 
 class ClaudeNotFoundError(RuntimeError):
@@ -191,7 +194,13 @@ class ClaudeRunner:
         self._wait_task: asyncio.Task | None = None
         self._closed = False
 
-    async def start(self) -> None:
+    async def start(self, resume_session_id: str | None = None) -> None:
+        """Launch the Claude subprocess.
+
+        If ``resume_session_id`` is provided, pass ``--resume <id>`` so
+        Claude reloads the stored conversation and the user can continue
+        where they left off (e.g. after the subprocess crashed or timed out).
+        """
         claude_bin = find_claude()
         if claude_bin is None:
             raise ClaudeNotFoundError("Could not locate `claude` CLI")
@@ -208,16 +217,21 @@ class ClaudeRunner:
             "--permission-mode=bypassPermissions",
             "--model",
             "sonnet",
-            # Append Frida-IDE conventions to the built-in system prompt so
-            # Claude knows to save hooks as .js files in the project dir
-            # (where Extract Script picks them up off disk) and to use the
-            # Frida API patterns the user expects.
             "--append-system-prompt",
             _load_system_prompt(),
         ]
+        if resume_session_id:
+            argv += ["--resume", resume_session_id]
 
         # Inherit environment so the user's keychain auth + CLAUDE_* vars work.
         env = dict(os.environ)
+
+        log.info(
+            "claude[%d]: starting subprocess (cwd=%s, resume=%s)",
+            self.ai_session_id,
+            self.cwd,
+            resume_session_id or "new",
+        )
 
         self.proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -226,15 +240,15 @@ class ClaudeRunner:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
-            # On Linux, ensure children die with the parent.
             preexec_fn=os.setsid if os.name == "posix" else None,
         )
+
+        log.info("claude[%d]: pid=%d started", self.ai_session_id, self.proc.pid)
 
         self._stdout_task = asyncio.create_task(self._pump_stdout())
         self._stderr_task = asyncio.create_task(self._pump_stderr())
         self._wait_task = asyncio.create_task(self._wait_done())
 
-        # Persist the AiSession PID so cleanup-on-restart can find orphans.
         with Session(engine()) as db:
             sess = db.get(AiSession, self.ai_session_id)
             if sess is not None:
@@ -250,9 +264,11 @@ class ClaudeRunner:
 
     async def _pump_stdout(self) -> None:
         assert self.proc is not None and self.proc.stdout is not None
+        log.debug("claude[%d]: stdout pump started", self.ai_session_id)
         while True:
             line = await self.proc.stdout.readline()
             if not line:
+                log.info("claude[%d]: stdout EOF", self.ai_session_id)
                 break
             text = line.decode("utf-8", errors="replace").strip()
             if not text:
@@ -260,12 +276,14 @@ class ClaudeRunner:
             try:
                 obj = json.loads(text)
             except json.JSONDecodeError:
+                log.warning("claude[%d]: non-JSON stdout: %s", self.ai_session_id, text[:200])
                 _publish(self.ai_session_id, {"type": "stderr", "text": text})
                 continue
             self._handle_event(obj)
 
     async def _pump_stderr(self) -> None:
         assert self.proc is not None and self.proc.stderr is not None
+        log.debug("claude[%d]: stderr pump started", self.ai_session_id)
         while True:
             line = await self.proc.stderr.readline()
             if not line:
@@ -273,11 +291,18 @@ class ClaudeRunner:
             text = line.decode("utf-8", errors="replace").rstrip()
             if not text:
                 continue
+            log.warning("claude[%d]: stderr: %s", self.ai_session_id, text[:300])
             _publish(self.ai_session_id, {"type": "stderr", "text": text})
 
     async def _wait_done(self) -> None:
         assert self.proc is not None
         rc = await self.proc.wait()
+        log.info(
+            "claude[%d]: process exited (rc=%s, pid=%s)",
+            self.ai_session_id,
+            rc,
+            self.proc.pid,
+        )
         _publish(self.ai_session_id, {"type": "exited", "returncode": rc})
         with Session(engine()) as db:
             sess = db.get(AiSession, self.ai_session_id)
@@ -290,8 +315,66 @@ class ClaudeRunner:
     def _handle_event(self, obj: dict) -> None:
         """Handle one parsed JSON event from Claude's stdout."""
         ev_type = obj.get("type")
+
+        # Log a concise one-liner per event so the backend console shows
+        # Claude's activity in real time.
+        if ev_type == "assistant":
+            msg = obj.get("message", {})
+            blocks = msg.get("content", [])
+            block_types = (
+                [b.get("type", "?") for b in blocks]
+                if isinstance(blocks, list)
+                else []
+            )
+            log.info(
+                "claude[%d]: ← assistant msg=%s blocks=%s",
+                self.ai_session_id,
+                msg.get("id", "?"),
+                block_types,
+            )
+        elif ev_type == "user":
+            msg = obj.get("message", {})
+            blocks = msg.get("content", [])
+            tu_ids = (
+                [b.get("tool_use_id", "?") for b in blocks if b.get("type") == "tool_result"]
+                if isinstance(blocks, list)
+                else []
+            )
+            log.info(
+                "claude[%d]: ← tool_result tool_use_ids=%s",
+                self.ai_session_id,
+                tu_ids,
+            )
+        elif ev_type == "system":
+            log.info(
+                "claude[%d]: ← system subtype=%s",
+                self.ai_session_id,
+                obj.get("subtype", "?"),
+            )
+        elif ev_type == "result":
+            log.info(
+                "claude[%d]: ← result subtype=%s is_error=%s",
+                self.ai_session_id,
+                obj.get("subtype", "?"),
+                obj.get("is_error", False),
+            )
+        else:
+            log.debug("claude[%d]: ← %s", self.ai_session_id, ev_type)
+
         # Forward the raw event to the WS topic
         _publish(self.ai_session_id, obj)
+
+        # Capture Claude's own session id from the init event so we can
+        # ``--resume`` later if the subprocess exits.
+        if ev_type == "system" and obj.get("subtype") == "init":
+            claude_sid = obj.get("session_id")
+            if claude_sid and isinstance(claude_sid, str):
+                with Session(engine()) as db:
+                    sess = db.get(AiSession, self.ai_session_id)
+                    if sess is not None:
+                        sess.claude_session_id = claude_sid
+                        db.add(sess)
+                        db.commit()
 
         # Persist messages we care about. We store the whole ``message``
         # object (not just ``content``) so Claude's ``message.id`` survives
@@ -302,9 +385,6 @@ class ClaudeRunner:
             message = obj.get("message", {})
             _persist_message(self.ai_session_id, "assistant", message)
         elif ev_type == "user":
-            # Tool results come back as user messages with content arrays.
-            # Store the full message (including Claude's message.id) for the
-            # same dedup reason.
             message = obj.get("message", {})
             _persist_message(self.ai_session_id, "tool_result", message)
         elif ev_type == "system":
@@ -313,6 +393,12 @@ class ClaudeRunner:
     async def send_user_message(self, text: str) -> None:
         if self.proc is None or self.proc.stdin is None or self._closed:
             raise RuntimeError("session not running")
+        log.info(
+            "claude[%d]: → user message (%d chars): %s",
+            self.ai_session_id,
+            len(text),
+            text[:80],
+        )
         envelope = {
             "type": "user",
             "message": {"role": "user", "content": text},
@@ -333,6 +419,8 @@ class ClaudeRunner:
         if self._closed:
             return
         self._closed = True
+        pid = self.proc.pid if self.proc else "?"
+        log.info("claude[%d]: stopping (pid=%s)", self.ai_session_id, pid)
         if self.proc is None:
             return
         try:
@@ -367,9 +455,11 @@ def get_runner(ai_session_id: int) -> ClaudeRunner | None:
     return _runners.get(ai_session_id)
 
 
-async def start_runner(ai_session_id: int, cwd: Path) -> ClaudeRunner:
+async def start_runner(
+    ai_session_id: int, cwd: Path, *, resume_session_id: str | None = None
+) -> ClaudeRunner:
     runner = ClaudeRunner(ai_session_id, cwd)
-    await runner.start()
+    await runner.start(resume_session_id=resume_session_id)
     _runners[ai_session_id] = runner
     return runner
 

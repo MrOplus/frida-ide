@@ -136,6 +136,8 @@ export interface AiSession {
   status: 'starting' | 'running' | 'stopped' | 'error'
   started_at: string
   ended_at: string | null
+  claude_session_id?: string | null
+  can_resume?: boolean
   project_name?: string
   cwd?: string
 }
@@ -300,6 +302,11 @@ export const api = {
       `/api/projects/${projectId}/ai/session/${sessionId}/message`,
       { method: 'POST', body: JSON.stringify({ text }) }
     ),
+  resumeAiSession: (projectId: number, sessionId: number) =>
+    request<AiSession>(
+      `/api/projects/${projectId}/ai/session/${sessionId}/resume`,
+      { method: 'POST' }
+    ),
   stopAiSession: (projectId: number, sessionId: number) =>
     request<{ ok: boolean }>(
       `/api/projects/${projectId}/ai/session/${sessionId}`,
@@ -386,6 +393,11 @@ export const api = {
     request<{ ok: boolean; deleted_events: number }>(`/api/sessions/${id}`, {
       method: 'DELETE',
     }),
+  deleteAllSessions: () =>
+    request<{ ok: boolean; deleted_sessions: number; deleted_events: number }>(
+      '/api/sessions',
+      { method: 'DELETE' }
+    ),
 
   // ----- Emulators (AVDs) -----
   emulators: () => request<AvdInfo[]>('/api/emulators'),

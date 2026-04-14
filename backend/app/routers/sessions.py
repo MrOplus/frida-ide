@@ -168,3 +168,43 @@ async def delete_session(session_id: int) -> dict:
         db.delete(rs)
         db.commit()
     return {"ok": True, "deleted_events": len(events)}
+
+
+@router.delete("")
+async def delete_all_sessions() -> dict:
+    """Delete every run-session and its hook-events. Running sessions are
+    stopped first via FridaManager so the Frida scripts are properly
+    unloaded."""
+    from ..services.frida_manager import get_manager
+
+    mgr = get_manager()
+
+    with Session(engine()) as db:
+        all_rs = list(db.exec(select(RunSession)).all())
+        total_sessions = len(all_rs)
+        total_events = 0
+
+        for rs in all_rs:
+            assert rs.id is not None
+            # Best-effort stop any live run
+            try:  # noqa: SIM105
+                await mgr.stop(rs.id)
+            except Exception:  # noqa: BLE001
+                pass
+            events = list(
+                db.exec(
+                    select(HookEvent).where(HookEvent.run_session_id == rs.id)
+                ).all()
+            )
+            total_events += len(events)
+            for e in events:
+                db.delete(e)
+            db.delete(rs)
+
+        db.commit()
+
+    return {
+        "ok": True,
+        "deleted_sessions": total_sessions,
+        "deleted_events": total_events,
+    }
