@@ -1,5 +1,6 @@
 import { useState, useMemo } from 'react'
-import { useNavigate, useParams, Link } from 'react-router-dom'
+import { useNavigate, Link } from 'react-router-dom'
+import { useTabParams } from '@/hooks/useTabParams'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   ChevronLeft,
@@ -19,7 +20,7 @@ import { toast } from '@/store/toastStore'
 type Tab = 'apps' | 'processes'
 
 export function ProcessesRoute() {
-  const { serial = '' } = useParams<{ serial: string }>()
+  const { serial = '' } = useTabParams<{ serial: string }>()
   const navigate = useNavigate()
   const setPendingRunFn = useEditorStore((s) => s.setPendingRun)
 

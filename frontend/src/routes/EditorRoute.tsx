@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useMemo } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
+import { useTabParams } from '@/hooks/useTabParams'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Search,
@@ -23,7 +24,7 @@ import { cn } from '@/lib/utils'
 type Status = 'idle' | 'starting' | 'running' | 'stopping' | 'error'
 
 export function EditorRoute() {
-  const { runSessionId: param } = useParams<{ runSessionId: string }>()
+  const { runSessionId: param } = useTabParams<{ runSessionId: string }>()
   const runSessionId = param ? parseInt(param, 10) : null
 
   const files = useEditorStore((s) => s.files)

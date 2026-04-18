@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { useParams, Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
+import { useTabParams } from '@/hooks/useTabParams'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   ChevronLeft,
@@ -25,7 +26,7 @@ const PRESET_PROMPTS = [
 ]
 
 export function ProjectAiRoute() {
-  const { projectId: param } = useParams<{ projectId: string }>()
+  const { projectId: param } = useTabParams<{ projectId: string }>()
   const projectId = param ? parseInt(param, 10) : null
   const navigate = useNavigate()
   const qc = useQueryClient()

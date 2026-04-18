@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { useParams, Link } from 'react-router-dom'
+import { Link } from 'react-router-dom'
+import { useTabParams } from '@/hooks/useTabParams'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronLeft, Package } from 'lucide-react'
 
@@ -8,7 +9,7 @@ import { FileTree } from '@/components/projects/FileTree'
 import { FileViewer } from '@/components/projects/FileViewer'
 
 export function ProjectFilesRoute() {
-  const { projectId: param } = useParams<{ projectId: string }>()
+  const { projectId: param } = useTabParams<{ projectId: string }>()
   const projectId = param ? parseInt(param, 10) : null
 
   const projectQuery = useQuery({
