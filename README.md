@@ -2,8 +2,6 @@
 
 A web-based IDE for [Frida](https://frida.re/) with an integrated AI assistant powered by [Claude Code](https://docs.claude.com/en/docs/claude-code/overview). It collapses the usual *terminal soup* — `adb`, `frida-server`, `frida` CLI, `apktool`, `jadx`, and a separate AI chat — into a single browser tab.
 
-> **Status:** active development. The full M0–M5 milestone set in [`backend/`](backend/) and [`frontend/`](frontend/) is wired up: device management, APK pipeline, Monaco editor, live `send()` console, AI chat, codeshare browser, emulator launcher, and session recording.
-
 ---
 
 ## What it does
@@ -20,6 +18,7 @@ A web-based IDE for [Frida](https://frida.re/) with an integrated AI assistant p
 | Flipping between a shell and the IDE | **Persistent bottom console** — a real PTY (your login shell) mounted at the Layout level. `Ctrl/Cmd+\`` to toggle, drag the top edge to resize; closed state hides via CSS so the shell + history survive toggles |
 | Pulling an app off a device to reverse it | **Pull APK** button next to every app in the process list. Handles split APKs (`pm path` + `adb pull` of every slice), drops them under `~/.frida-ide/pulled/<serial>/<pkg>/`, then shows an **Open in new project** action on the success toast that decompiles them into a fresh project in one click |
 | Switching between AI chat and the editor | Per-project Claude session, scoped `cwd` to the decompiled tree, streamed via stream-json. **Extract Script** reads the canonical file from disk (so iterative `Write → Edit → Edit` lands the full current script, not a patch fragment) |
+| Losing your AI chat (or live run console) when you navigate away | **Workspace tabs** — every view you open (AI chat, Editor, Project files, Processes, …) becomes a tab in a strip above the main pane. Each tab stays mounted while inactive (toggled via CSS), so WebSockets, Monaco buffers, the Claude stream, and scroll positions all survive switching. Open tabs persist to `localStorage` and the active tab is driven by the URL so refresh / back-forward still work |
 | Reusable hook libraries | First-boot seeded snippet library (SSL pinning bypass, root-detection bypass, intent logger, crypto observer, method tracer, …) plus a [codeshare.frida.re](https://codeshare.frida.re/) browser with one-click import |
 | Lost output on reconnect | All WebSocket topics back onto a 10k-event ring buffer with `last_event_id` replay, and `ws.send_json` is serialised behind an asyncio lock so the pump + heartbeat can't race on a single socket |
 | Finding what's running right now | Top bar **Projects** chip lists every project with its pipeline-status badge; **Sessions** chip pulses green when at least one Frida run is active and lists them with mode icon + target + elapsed time — click to jump straight into the live editor |
@@ -155,7 +154,8 @@ frida-ide                      # console entry point — serves API + SPA on :87
 7. **Spawn / Attach** — script loads, `send()` messages stream into the xterm console next to the editor. If `device.spawn` hits the `unable to pick a payload base` bug on older emulator images, the IDE automatically falls back to `monkey … LAUNCHER 1` + attach.
 8. **Bottom console** — `Ctrl/Cmd+\`` pops a real login shell at the bottom of the window (a `pty.fork`'d child of the backend). Drag the top edge to resize; closing the drawer hides it via CSS but the shell stays alive. Great for one-off `adb logcat`, editing the pulled APKs, or tailing files.
 9. **TopBar menus** — the **Projects** chip lists every project with its current pipeline status; click to jump to its files. The **Sessions** chip pulses when a Frida run is active and lets you jump straight back into the live editor for any running session.
-10. **Sessions tab** — every run is recorded with all its `send()` / error / status events; export the JSON for replay or sharing.
+10. **Workspace tabs** — every view you opened (AI chat, Editor, Project files, Processes, Sessions, …) sits in a tab strip above the main pane. Tabs stay mounted while inactive — the AI chat keeps streaming, the editor's Monaco buffer keeps your cursor position, the live `send()` console keeps receiving — so flipping back to the AI chat after a Run is one click instead of a full re-navigation through Projects → AI Chat. Tabs persist to `localStorage`; close with the X or middle-click.
+11. **Sessions tab** — every run is recorded with all its `send()` / error / status events; export the JSON for replay or sharing.
 
 ---
 
@@ -318,14 +318,17 @@ frida-ide/
     └── src/
         ├── routes/                 # Dashboard, Devices, Editor, Processes, Projects, ProjectFiles, ProjectAi, Snippets, Sessions
         ├── components/
-        │   ├── layout/             # Sidebar, TopBar, TopBarMenus, BottomConsole, Toaster
+        │   ├── layout/             # Sidebar, TopBar, TopBarMenus, Workspace, TabStrip, BottomConsole, Toaster
         │   ├── devices/            # DeviceCard, FridaServerControls
         │   ├── editor/             # MonacoPane, RunControls, OutputConsole, SnippetPicker
         │   ├── projects/           # ApkUpload, FileTree, FileViewer
         │   ├── ai/                 # ChatPane, ChatMessage, streamReducer
         │   └── snippets/           # SnippetCard, CodeshareBrowser
+        ├── hooks/
+        │   └── useTabParams.ts     # per-tab params context (replaces useParams)
         ├── lib/{api.ts, ws.ts, utils.ts}
         └── store/
+            ├── workspaceStore.ts   # ★ open tabs + activeId, path↔tab resolver, persisted
             ├── editorStore.ts      # multi-file tabs, pendingRun, lastTarget, activeRunSessionId
             ├── uiStore.ts          # bottom-console open/height (persisted)
             └── toastStore.ts       # imperative toast.success/error/info + action buttons
